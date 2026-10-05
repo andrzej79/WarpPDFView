@@ -1,0 +1,7 @@
+# Copy to ftp_config.local (git-ignored) and fill in.  AMIGA_FTP_* in the
+# environment override these.
+AMIGA_FTP_HOST=192.168.x.y
+AMIGA_FTP_USER=user
+AMIGA_FTP_PASSWORD=password
+#AMIGA_FTP_PORT=21
+#AMIGA_FTP_PASSIVE=no

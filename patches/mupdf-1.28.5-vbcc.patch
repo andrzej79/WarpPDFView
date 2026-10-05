@@ -1,0 +1,547 @@
+--- a/include/mupdf/fitz/context.h
++++ b/include/mupdf/fitz/context.h
+@@ -738,14 +738,20 @@
+ /**
+ 	Flexible array member allocation helpers.
+ */
++#ifdef __VBCC__
++/* vbcc's offsetof() takes a plain member name, and M here may be nested. */
++#define fz_offsetof_(T, M) ((size_t)&((T *)0)->M)
++#else
++#define fz_offsetof_(T, M) offsetof(T, M)
++#endif
+ #define fz_malloc_flexible(ctx, T, M, count) \
+-	((T*)Memento_label(fz_calloc(ctx, 1, offsetof(T, M) + sizeof(*((T*)0)->M) * (count)), #T))
+-#define fz_realloc_flexible(ctx, p, T, M, count) \
+-	((T*)Memento_label(fz_realloc(ctx, p, offsetof(T, M) + sizeof(*((T*)0)->M) * (count)), #T))
++	((T*)Memento_label(fz_calloc(ctx, 1, fz_offsetof_(T, M) + sizeof(*((T*)0)->M) * (count)), #T))
++#define fz_realloc_flexible(ctx, p, T, M, count) \
++	((T*)Memento_label(fz_realloc(ctx, p, fz_offsetof_(T, M) + sizeof(*((T*)0)->M) * (count)), #T))
+ #define fz_pool_alloc_flexible(ctx, pool, T, M, count) \
+-	((T*)fz_pool_alloc(ctx, pool, offsetof(T, M) + sizeof(*((T*)0)->M) * (count)))
++	((T*)fz_pool_alloc(ctx, pool, fz_offsetof_(T, M) + sizeof(*((T*)0)->M) * (count)))
+ #define fz_sizeof_flexible(T, M, count) \
+-	(offsetof(T, M) + sizeof(*((T*)0)->M) * (count))
++	(fz_offsetof_(T, M) + sizeof(*((T*)0)->M) * (count))
+ 
+ /**
+ 	fz_malloc equivalent that returns NULL rather than throwing
+--- a/include/mupdf/fitz/system.h
++++ b/include/mupdf/fitz/system.h
+@@ -39,6 +39,21 @@
+ #include <setjmp.h> /* needed for the try/catch macros */
+ #include <stdio.h> /* useful for debug printfs */
+ 
++#ifdef __VBCC__
++/* vbcc's libc numbers SEEK_SET/CUR/END -1/0/1.  MuPDF means the POSIX 0/1/2,
++   through these names and as bare literals alike, so here they are POSIX, and
++   fz_stdio_whence() converts where a stdio FILE is actually seeked. */
++#undef SEEK_SET
++#undef SEEK_CUR
++#undef SEEK_END
++#define SEEK_SET 0
++#define SEEK_CUR 1
++#define SEEK_END 2
++#define fz_stdio_whence(w) ((w) - 1)
++#else
++#define fz_stdio_whence(w) (w)
++#endif
++
+ #ifdef __cplusplus
+ /* C++ doesn't support flexible array members... */
+ #define FZ_FLEXIBLE_ARRAY 1
+--- a/source/fitz/document.c
++++ b/source/fitz/document.c
+@@ -41,7 +41,7 @@
+ fz_new_output_to_tempfile(fz_context *ctx, char **namep)
+ {
+ 	fz_output *out = NULL;
+-#ifdef _WIN32
++#if defined(_WIN32) || defined(__VBCC__)
+ 	char namebuf[L_tmpnam];
+ 	int attempts = 0;
+ #else
+@@ -51,8 +51,8 @@
+ 
+ 	fz_var(out);
+ 
+-#ifdef _WIN32
+-	/* Windows has no mkstemp command, so we have to use the old-style
++#if defined(_WIN32) || defined(__VBCC__)
++	/* Windows (and vbcc's libc) has no mkstemp command, so we have to use the old-style
+ 	 * tmpnam based system, and retry in the case of races. */
+ 	do
+ 	{
+--- a/source/fitz/filter-lzw.c
++++ b/source/fitz/filter-lzw.c
+@@ -59,6 +59,7 @@
+ 	int code;			/* current code */
+ 	int old_code;			/* previously recognized code */
+ 	int next_code;			/* next free entry */
++	int failed;			/* a bad code was met after some output */
+ 
+ 	lzw_code table[NUM_CODES];
+ 
+@@ -84,10 +85,36 @@
+ 	int old_code = lzw->old_code;
+ 	int next_code = lzw->next_code;
+ 
+-	if (len > sizeof(lzw->buffer))
+-		len = sizeof(lzw->buffer);
+-	ep = buf + len;
++	/* Fast paths, for compilers that call rather than inline the stream
++	   helpers (vbcc: two calls and a dozen memory accesses per code).  A code
++	   is read straight from the chain's buffer when two bytes are there - it
++	   is at most 12 bits - leaving bits/avail exactly as fz_read_bits()
++	   would; and a string that fits the output is written into it directly
++	   rather than through bp.  Anything else takes the original path. */
++	fz_stream *chain = lzw->chain;
++	int fast_bits = !lzw->reverse_bits;
+ 
++	/* len is a hint that may be ignored (fz_stream_next_fn), and it is: a
++	   byte-at-a-time reader - the content-stream lexer, via fz_read_byte() -
++	   asks for 1, and honouring that cost a call, a state reload and an
++	   fz_try per decoded byte.  The whole buffer is filled instead, as
++	   filter-flate.c does.  Reading ahead can only go further into the input
++	   than before when the stream has no EOD code - the same exposure Flate
++	   has for an inline image. */
++	(void)len;
++	ep = buf + sizeof(lzw->buffer);
++
++	/* A bad code met with output already decoded ends that call early, so
++	   the output is not lost with the throw; the throw comes here, next. */
++#define LZW_FAIL() \
++	do { \
++		if (p > buf) { lzw->failed = 1; goto out; } \
++		fz_throw(ctx, FZ_ERROR_FORMAT, "out of range code encountered in lzw decode"); \
++	} while (0)
++
++	if (lzw->failed)
++		fz_throw(ctx, FZ_ERROR_FORMAT, "out of range code encountered in lzw decode");
++
+ 	while (lzw->rp < lzw->wp && p < ep)
+ 		*p++ = *lzw->rp++;
+ 
+@@ -96,18 +123,44 @@
+ 		if (lzw->eod)
+ 			return EOF;
+ 
+-		if (fz_is_eof_bits(ctx, lzw->chain))
++		if (fast_bits && chain->wp - chain->rp >= 2)
+ 		{
+-			fz_warn(ctx, "premature end in lzw decode");
+-			lzw->eod = 1;
+-			break;
++			int avail = chain->avail;
++			if (code_bits <= avail)
++			{
++				avail -= code_bits;
++				code = (chain->bits >> avail) & ((1 << code_bits) - 1);
++			}
++			else
++			{
++				unsigned int x = chain->bits & ((1 << avail) - 1);
++				int n = code_bits - avail;
++				if (n > 8)
++				{
++					x = (x << 8) | *chain->rp++;
++					n -= 8;
++				}
++				chain->bits = *chain->rp++;
++				avail = 8 - n;
++				code = (int)((x << n) | (chain->bits >> avail));
++			}
++			chain->avail = avail;
+ 		}
+-
+-		if (lzw->reverse_bits)
+-			code = fz_read_rbits(ctx, lzw->chain, code_bits);
+ 		else
+-			code = fz_read_bits(ctx, lzw->chain, code_bits);
++		{
++			if (fz_is_eof_bits(ctx, lzw->chain))
++			{
++				fz_warn(ctx, "premature end in lzw decode");
++				lzw->eod = 1;
++				break;
++			}
+ 
++			if (lzw->reverse_bits)
++				code = fz_read_rbits(ctx, lzw->chain, code_bits);
++			else
++				code = fz_read_bits(ctx, lzw->chain, code_bits);
++		}
++
+ 		if (code == LZW_EOD(lzw))
+ 		{
+ 			lzw->eod = 1;
+@@ -135,7 +188,7 @@
+ 			/* We've just done a clear, and this is the first of a new
+ 			 * sequence. It must be one of our existing dictionary entries. */
+ 			if (code >= LZW_FIRST(lzw))
+-				fz_throw(ctx, FZ_ERROR_FORMAT, "out of range code encountered in lzw decode");
++				LZW_FAIL();
+ 			old_code = code;
+ 		}
+ 		else if (!lzw->old_tiff && next_code == NUM_CODES)
+@@ -146,7 +199,7 @@
+ 		}
+ 		else if (code > next_code || (!lzw->old_tiff && next_code >= NUM_CODES))
+ 		{
+-			fz_throw(ctx, FZ_ERROR_FORMAT, "out of range code encountered in lzw decode");
++			LZW_FAIL();
+ 		}
+ 		else if (next_code < NUM_CODES)
+ 		{
+@@ -159,7 +212,7 @@
+ 			else if (code == next_code)
+ 				table[next_code].value = table[next_code].first_char;
+ 			else
+-				fz_throw(ctx, FZ_ERROR_FORMAT, "out of range code encountered in lzw decode");
++				LZW_FAIL();
+ 
+ 			next_code ++;
+ 
+@@ -174,9 +227,30 @@
+ 		}
+ 
+ 		/* code maps to a string, copy to output (in reverse...) */
+-		if (code >= LZW_CLEAR(lzw))
++		if (code >= LZW_CLEAR(lzw) && table[code].length > 0 && table[code].length <= ep - p)
+ 		{
++			/* ...straight into the output when it fits (a length of 0 only
++			   comes from a corrupt stream, and keeps the original path) */
+ 			codelen = table[code].length;
++			s = p + codelen;
++			do {
++				*(--s) = table[code].value;
++				code = table[code].prev;
++			} while (code >= 0 && s > p);
++			p += codelen;
++			lzw->rp = lzw->wp = lzw->bp;
++			continue;
++		}
++		else if (code < LZW_CLEAR(lzw))
++		{
++			/* a single character; p < ep holds inside this loop */
++			*p++ = (unsigned char)code;
++			lzw->rp = lzw->wp = lzw->bp;
++			continue;
++		}
++		else
++		{
++			codelen = table[code].length;
+ 			lzw->rp = lzw->bp;
+ 			lzw->wp = lzw->bp + codelen;
+ 
+@@ -189,19 +263,13 @@
+ 			} while (code >= 0 && s > lzw->bp);
+ 		}
+ 
+-		/* ... or just a single character */
+-		else
+-		{
+-			lzw->bp[0] = code;
+-			lzw->rp = lzw->bp;
+-			lzw->wp = lzw->bp + 1;
+-		}
+-
+ 		/* copy to output */
+ 		while (lzw->rp < lzw->wp && p < ep)
+ 			*p++ = *lzw->rp++;
+ 	}
+ 
++out:
++#undef LZW_FAIL
+ 	lzw->code_bits = code_bits;
+ 	lzw->code = code;
+ 	lzw->old_code = old_code;
+--- a/source/fitz/geometry.c
++++ b/source/fitz/geometry.c
+@@ -25,6 +25,16 @@
+ #include <math.h>
+ #include <float.h>
+ #include <limits.h>
++
++#ifdef __VBCC__
++/* vbcc: INFINITY and NAN are loads from a library object, not constants, so
++   they cannot initialise the const quads below.  vbcc folds these two
++   expressions to the IEEE bit patterns 0x7f800000 and 0x7fc00000. */
++#undef INFINITY
++#define INFINITY ((float)1e39)
++#undef NAN
++#define NAN ((float)1e39 - (float)1e39)
++#endif
+ 
+ #define MAX4(a,b,c,d) fz_max(fz_max(a,b), fz_max(c,d))
+ #define MIN4(a,b,c,d) fz_min(fz_min(a,b), fz_min(c,d))
+--- a/source/fitz/output.c
++++ b/source/fitz/output.c
+@@ -157,7 +157,7 @@
+ #ifdef _WIN32
+ 	int n = _fseeki64(file, off, whence);
+ #else
+-	int n = fseeko(file, off, whence);
++	int n = fseeko(file, off, fz_stdio_whence(whence));
+ #endif
+ 	if (n < 0)
+ 		fz_throw(ctx, FZ_ERROR_SYSTEM, "cannot fseek: %s", strerror(errno));
+@@ -307,7 +307,7 @@
+ 		if (file == NULL)
+ 			file = FOPEN(filename, "wb+");
+ 		else
+-			fseek(file, 0, SEEK_END);
++			fseek(file, 0, fz_stdio_whence(SEEK_END));
+ 	}
+ #undef FOPEN
+ #undef REMOVE
+--- a/source/fitz/path.c
++++ b/source/fitz/path.c
+@@ -1582,7 +1582,7 @@
+ 	FZ_LINECAP_BUTT, FZ_LINECAP_BUTT, FZ_LINECAP_BUTT,
+ 	FZ_LINEJOIN_MITER,
+ 	1, 10,
+-	0, 0, { 0 }
++	0, 0
+ };
+ 
+ fz_stroke_state *
+--- a/source/fitz/separation.c
++++ b/source/fitz/separation.c
+@@ -786,7 +786,7 @@
+ 		 * that into RGB.  We handle that case here. */
+ 		if (fz_colorspace_is_subtractive(ctx, src->colorspace) &&
+ 			!fz_colorspace_is_subtractive(ctx, dst->colorspace) &&
+-			src->seps > 0 &&
++			src->seps != NULL &&
+ 			fz_compare_separations(ctx, dst->seps, src->seps))
+ 		{
+ 			/* Converting from CMYK + Spots -> RGB with a change in spots. */
+--- a/source/fitz/stream-open.c
++++ b/source/fitz/stream-open.c
+@@ -143,7 +143,7 @@
+ #ifdef _WIN32
+ 	int64_t n = _fseeki64(state->file, offset, whence);
+ #else
+-	int64_t n = fseeko(state->file, offset, whence);
++	int64_t n = fseeko(state->file, offset, fz_stdio_whence(whence));
+ #endif
+ 	if (n < 0)
+ 		fz_throw(ctx, FZ_ERROR_SYSTEM, "cannot seek: %s", strerror(errno));
+--- a/source/fitz/string.c
++++ b/source/fitz/string.c
+@@ -293,6 +293,14 @@
+ 	for (i=0; buf[i]; ++i)
+ 		if (buf[i] == '\\')
+ 			buf[i] = '/';
++	return buf;
++}
++
++#elif defined(__VBCC__)
++
++char *fz_realpath(const char *path, char *buf)
++{
++	fz_strlcpy(buf, path, PATH_MAX);
+ 	return buf;
+ }
+ 
+@@ -886,6 +894,54 @@
+ 	}
+ }
+ 
++/* Plain decimals - [-+]digits[.digits], at most 7 significant digits and 10
++   after the point - as one float division.  Both operands are exact in a
++   float (mantissa < 2^24, 10^k with k <= 10), so the IEEE division rounds the
++   exact quotient once: the same float fz_strtof() returns.  An FPU that
++   divides in extended precision first cannot differ either: a quotient over
++   5^10 at most lies more than 2^-50 from any float rounding midpoint, far
++   beyond extended's 2^-64.  Everything else returns 0 and takes the full
++   parser; fz_strtof() on a 68k is 64-bit integer arithmetic throughout, and
++   content streams are mostly numbers like these. */
++static int fast_decimal(const char *s, float *out)
++{
++	static const float pow10f[11] = { 1e0f, 1e1f, 1e2f, 1e3f, 1e4f, 1e5f, 1e6f, 1e7f, 1e8f, 1e9f, 1e10f };
++	unsigned long mant = 0;
++	int neg = 0, frac = -1, digits = 0, any = 0;
++	float v;
++
++	if (*s == '-' || *s == '+')
++		neg = (*s++ == '-');
++	for (;; s++)
++	{
++		if (*s >= '0' && *s <= '9')
++		{
++			any = 1;
++			if (mant != 0 || *s != '0')
++			{
++				if (++digits > 7)
++					return 0;
++			}
++			mant = mant * 10 + (unsigned long)(*s - '0');
++			if (frac >= 0 && ++frac > 10)
++				return 0;
++		}
++		else if (*s == '.' && frac < 0)
++			frac = 0;
++		else if (*s == 0)
++			break;
++		else
++			return 0;
++	}
++	if (!any)
++		return 0; /* no digits at all: "", "-", "." */
++	v = (float)mant;
++	if (frac > 0)
++		v = v / pow10f[frac];
++	*out = neg ? -v : v;
++	return 1;
++}
++
+ float fz_atof(const char *s)
+ {
+ 	float result;
+@@ -893,6 +949,9 @@
+ 	if (s == NULL)
+ 		return 0;
+ 
++	if (fast_decimal(s, &result))
++		return result;
++
+ 	errno = 0;
+ 	result = fz_strtof(s, NULL);
+ 	if ((errno == ERANGE && result == 0) || isnan(result))
+--- a/source/fitz/xml.c
++++ b/source/fitz/xml.c
+@@ -460,7 +460,7 @@
+ 	size_t size;
+ 
+ 	if (is_text)
+-		size = offsetof(fz_xml, u.node.u.text) + b-a+1;
++		size = ((size_t)&((fz_xml *)0)->u.node.u.text) + b-a+1;
+ 	else
+ 	{
+ 		/* skip namespace prefix */
+@@ -468,7 +468,7 @@
+ 			if (*ns == ':')
+ 				a = ns + 1;
+ 
+-		size = offsetof(fz_xml, u.node.u.d.name) + b-a+1;
++		size = ((size_t)&((fz_xml *)0)->u.node.u.d.name) + b-a+1;
+ 	}
+ 	head = fz_pool_alloc(ctx, parser->pool, size);
+ 
+--- a/source/pdf/pdf-signature.c
++++ b/source/pdf/pdf-signature.c
+@@ -213,7 +213,7 @@
+ 	pdf_obj *fields;
+ 	static pdf_obj *ff_names[2] = { PDF_NAME(Ff), NULL };
+ 	pdf_obj *ff = NULL;
+-	static fieldname_prefix null_prefix = { NULL, { 0 } };
++	static fieldname_prefix null_prefix = { NULL };
+ 	sig_locking_data data = { locked, &null_prefix };
+ 
+ 	if (locked == NULL)
+--- a/thirdparty/freetype/include/freetype/internal/ftstream.h
++++ b/thirdparty/freetype/include/freetype/internal/ftstream.h
+@@ -113,6 +113,16 @@
+           }
+ 
+ #define FT_MAKE_EMPTY_FIELD( frame_op )  { frame_op, 0, 0 }
++
++  /* One element of an array field, `field[idx]`.  vbcc's offsetof() takes a */
++  /* plain member name only, so the index is added outside it.              */
++#define FT_FRAME_FIELD_IDX( frame_op, field, idx )                     \
++          {                                                           \
++            frame_op,                                                 \
++            FT_FIELD_SIZE_DELTA( field ),                             \
++            (FT_UShort)( offsetof( FT_STRUCTURE, field ) +            \
++                         ( idx ) * sizeof ( ( (FT_STRUCTURE*)0 )->field[0] ) ) \
++          }
+ 
+ #define FT_FRAME_START( size )   { ft_frame_start, 0, size }
+ #define FT_FRAME_END             { ft_frame_end, 0, 0 }
+--- a/thirdparty/freetype/src/sfnt/ttload.c
++++ b/thirdparty/freetype/src/sfnt/ttload.c
+@@ -672,10 +672,10 @@
+         FT_FRAME_LONG  ( Magic_Number ),
+         FT_FRAME_USHORT( Flags ),
+         FT_FRAME_USHORT( Units_Per_EM ),
+-        FT_FRAME_ULONG ( Created[0] ),
+-        FT_FRAME_ULONG ( Created[1] ),
+-        FT_FRAME_ULONG ( Modified[0] ),
+-        FT_FRAME_ULONG ( Modified[1] ),
++        FT_FRAME_FIELD_IDX( ft_frame_ulong_be, Created, 0 ),
++        FT_FRAME_FIELD_IDX( ft_frame_ulong_be, Created, 1 ),
++        FT_FRAME_FIELD_IDX( ft_frame_ulong_be, Modified, 0 ),
++        FT_FRAME_FIELD_IDX( ft_frame_ulong_be, Modified, 1 ),
+         FT_FRAME_SHORT ( xMin ),
+         FT_FRAME_SHORT ( yMin ),
+         FT_FRAME_SHORT ( xMax ),
+@@ -1188,24 +1188,24 @@
+         FT_FRAME_SHORT ( yStrikeoutSize ),
+         FT_FRAME_SHORT ( yStrikeoutPosition ),
+         FT_FRAME_SHORT ( sFamilyClass ),
+-        FT_FRAME_BYTE  ( panose[0] ),
+-        FT_FRAME_BYTE  ( panose[1] ),
+-        FT_FRAME_BYTE  ( panose[2] ),
+-        FT_FRAME_BYTE  ( panose[3] ),
+-        FT_FRAME_BYTE  ( panose[4] ),
+-        FT_FRAME_BYTE  ( panose[5] ),
+-        FT_FRAME_BYTE  ( panose[6] ),
+-        FT_FRAME_BYTE  ( panose[7] ),
+-        FT_FRAME_BYTE  ( panose[8] ),
+-        FT_FRAME_BYTE  ( panose[9] ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 0 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 1 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 2 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 3 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 4 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 5 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 6 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 7 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 8 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, panose, 9 ),
+         FT_FRAME_ULONG ( ulUnicodeRange1 ),
+         FT_FRAME_ULONG ( ulUnicodeRange2 ),
+         FT_FRAME_ULONG ( ulUnicodeRange3 ),
+         FT_FRAME_ULONG ( ulUnicodeRange4 ),
+-        FT_FRAME_BYTE  ( achVendID[0] ),
+-        FT_FRAME_BYTE  ( achVendID[1] ),
+-        FT_FRAME_BYTE  ( achVendID[2] ),
+-        FT_FRAME_BYTE  ( achVendID[3] ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, achVendID, 0 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, achVendID, 1 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, achVendID, 2 ),
++        FT_FRAME_FIELD_IDX( ft_frame_byte, achVendID, 3 ),
+ 
+         FT_FRAME_USHORT( fsSelection ),
+         FT_FRAME_USHORT( usFirstCharIndex ),
+--- a/thirdparty/freetype/src/sfnt/ttmtx.c
++++ b/thirdparty/freetype/src/sfnt/ttmtx.c
+@@ -150,10 +150,10 @@
+         FT_FRAME_SHORT ( caret_Slope_Rise ),
+         FT_FRAME_SHORT ( caret_Slope_Run ),
+         FT_FRAME_SHORT ( caret_Offset ),
+-        FT_FRAME_SHORT ( Reserved[0] ),
+-        FT_FRAME_SHORT ( Reserved[1] ),
+-        FT_FRAME_SHORT ( Reserved[2] ),
+-        FT_FRAME_SHORT ( Reserved[3] ),
++        FT_FRAME_FIELD_IDX( ft_frame_short_be, Reserved, 0 ),
++        FT_FRAME_FIELD_IDX( ft_frame_short_be, Reserved, 1 ),
++        FT_FRAME_FIELD_IDX( ft_frame_short_be, Reserved, 2 ),
++        FT_FRAME_FIELD_IDX( ft_frame_short_be, Reserved, 3 ),
+         FT_FRAME_SHORT ( metric_Data_Format ),
+         FT_FRAME_USHORT( number_Of_HMetrics ),
+       FT_FRAME_END
+--- a/thirdparty/zlib/zconf.h
++++ b/thirdparty/zlib/zconf.h
+@@ -509,6 +509,9 @@
+ #  define Z_WANT64
+ #endif
+ 
++#if defined(__VBCC__) && !defined(Z_SOLO)
++#  include <stdio.h>   /* vbcc: its own SEEK_* (-1/0/1), before the fallback below */
++#endif
+ #if !defined(SEEK_SET) && !defined(Z_SOLO)
+ #  define SEEK_SET        0       /* Seek from beginning of file.  */
+ #  define SEEK_CUR        1       /* Seek from current position.  */

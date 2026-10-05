@@ -1,0 +1,11 @@
+# Build output
+build/
+# MuPDF source and tarball, from ./fetch_mupdf.sh
+thirdparty/
+# FTP login for tools/amiget.py - never commit
+tools/ftp_config.local
+# Test output and files fetched from the Amiga (tools/amiget.py): local
+# measurements only
+temp/
+# Python bytecode from importing tools/*.py
+__pycache__/
